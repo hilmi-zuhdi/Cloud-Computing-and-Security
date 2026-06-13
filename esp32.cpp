@@ -46,13 +46,15 @@ static const char AWS_CERT_PRIVATE[] PROGMEM = R"EOF(
 
 const int SAMPLE_RATE_HZ = 250; 
 const unsigned long SAMPLE_INTERVAL_US = 1000000 / SAMPLE_RATE_HZ; // 4000 mikrosekon
-const int TOTAL_SAMPLES = 1250; 
+const int TOTAL_SAMPLES = 1250; // Tepat 5 detik (1250 / 250 = 5)
 
 int ecgBuffer[TOTAL_SAMPLES];
 int sampleIndex = 0;
 unsigned long lastSampleTime = 0;
-unsigned long lastLeadOffWarn = 0;
 bool statusLeadOffSudahTerkirim = false;
+
+// Variabel untuk melacak rentang waktu 5 detik
+unsigned long captureStartTime = 0; 
 
 WiFiClientSecure net;
 PubSubClient client(net);
@@ -75,8 +77,6 @@ void connectAWS() {
   net.setCertificate(AWS_CERT_CRT);
   net.setPrivateKey(AWS_CERT_PRIVATE);
   client.setServer(AWS_IOT_ENDPOINT, 8883);
-  
-  // Buffer diperbesar menjadi 16KB untuk menampung JSON array berukuran besar
   client.setBufferSize(16384);
 
   while (!client.connected()) {
@@ -105,7 +105,6 @@ void loop() {
   bool isLeadOff = (digitalRead(LO_PLUS_PIN) == 1 || digitalRead(LO_MINUS_PIN) == 1);
 
   if (isLeadOff) {
-    // Hanya eksekusi publish MQTT jika alarm belum pernah dikirim
     if (!statusLeadOffSudahTerkirim) {
       Serial.println("[DARURAT] Elektroda lepas dari pasien!");
       JsonDocument doc;
@@ -118,15 +117,12 @@ void loop() {
       serializeJson(doc, outputJson);
       client.publish(MQTT_TOPIC, outputJson.c_str());
       
-      // Kunci bendera agar tidak mengirim pesan spam di siklus berikutnya
       statusLeadOffSudahTerkirim = true; 
     }
-    // Jeda singkat untuk stabilitas, tidak perlu 2000ms karena sudah ada bendera
     delay(100); 
-    sampleIndex = 0; // Reset buffer karena sinyal sedang tidak valid
+    sampleIndex = 0; 
     return;
   } else {
-    // Jika sensor sudah terpasang kembali dengan benar, buka kunci benderanya
     statusLeadOffSudahTerkirim = false;
   }
 
@@ -135,14 +131,24 @@ void loop() {
   if (currentMicros - lastSampleTime >= SAMPLE_INTERVAL_US) {
     lastSampleTime = currentMicros;
     
+    // Catat Waktu Mulai (Start Time) pada sampel pertama
+    if (sampleIndex == 0) {
+      captureStartTime = time(nullptr);
+    }
+    
     ecgBuffer[sampleIndex] = analogRead(ECG_PIN);
     sampleIndex++;
 
+    // Jika sudah mencapai batas jendela waktu 5 detik (1250 sample)
     if (sampleIndex >= TOTAL_SAMPLES) {
+      unsigned long captureEndTime = time(nullptr); // Catat Waktu Selesai (End Time)
+
       JsonDocument doc;
       doc["device_id"] = DEVICE_ID;
       doc["nama_pasien"] = NAMA_PASIEN;
       doc["lead_off"] = false;
+      doc["start_time"] = captureStartTime;  // Menjawab masukan penguji
+      doc["end_time"] = captureEndTime;      // Menjawab masukan penguji
       
       JsonArray payload = doc["payload"].to<JsonArray>();
       for (int i = 0; i < TOTAL_SAMPLES; i++) {
@@ -153,7 +159,7 @@ void loop() {
       serializeJson(doc, outputJson);
       
       if (client.publish(MQTT_TOPIC, outputJson.c_str())) {
-         Serial.println("Berhasil mengirim " + String(TOTAL_SAMPLES) + " sampel data ke AWS.");
+         Serial.println("Berhasil mengirim data durasi 5 detik (" + String(TOTAL_SAMPLES) + " sampel) ke AWS.");
       } else {
          Serial.println("Gagal mengirim data. Coba cek ukuran buffer atau koneksi!");
       }
