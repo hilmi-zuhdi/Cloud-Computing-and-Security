@@ -76,7 +76,25 @@ def lambda_handler(event, context):
                 avg_rr = np.mean(rr_intervals_ms)
                 bpm = round((60000.0 / avg_rr), 2)
             
-            # Triase Kondisi
+            # ========================================================
+            # INTERVENSI DEMO MODE (Ubah via Environment Variable AWS)
+            # ========================================================
+            demo_mode = os.environ.get('DEMO_MODE', 'DISABLED')
+            
+            if demo_mode == 'TACHYCARDIA':
+                bpm = bpm * 1.8 
+                if bpm < 110: 
+                    bpm = 135.0 
+            elif demo_mode == 'BRADYCARDIA':
+                bpm = bpm * 0.5
+                if bpm > 50: 
+                    bpm = 45.0
+                    
+            # Pastikan nilai kembali rapi dengan 2 angka di belakang koma
+            bpm = round(bpm, 2)
+            # ========================================================
+            
+            # Triase Kondisi (Menggunakan BPM yang sudah diintervensi)
             if bpm > 100:
                 status_medis = "Tachycardia"
                 alert_triggered = True
@@ -88,13 +106,13 @@ def lambda_handler(event, context):
                 condition_attr = "BRADYCARDIA"
                 severity_attr = "WARNING"
 
-            # --- SOLUSI ALTERNATIF 1: PLOT GRAFIK & GENERATE S3 URL ---
+            # --- PLOT GRAFIK & GENERATE S3 URL JIKA ADA ALERT ---
             if alert_triggered:
                 # Membuat Grafik Visual
                 plt.figure(figsize=(10, 4))
                 waktu_x = np.linspace(0, 5, len(filtered_ecg)) # Rentang 5 Detik
                 plt.plot(waktu_x, filtered_ecg, color='red' if condition_attr == "TACHYCARDIA" else 'blue')
-                plt.title(f"Visualisasi ECG Jendela 5 Detik - {status_medis}")
+                plt.title(f"Visualisasi ECG Jendela 5 Detik - {status_medis} ({bpm} BPM)")
                 plt.xlabel("Waktu (Detik)")
                 plt.ylabel("Amplitudo (ADC Filtered)")
                 plt.grid(True)
