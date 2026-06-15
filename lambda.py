@@ -81,7 +81,7 @@ def lambda_handler(event, context):
                 bpm = round((60000.0 / avg_rr), 2)
             
             # ========================================================
-            # INTERVENSI DEMO MODE (Ubah via Environment Variable AWS)
+            # INTERVENSI DEMO MODE
             # ========================================================
             demo_mode = os.environ.get('DEMO_MODE', 'DISABLED')
             
@@ -95,7 +95,6 @@ def lambda_handler(event, context):
                     bpm = 45.0
                     
             bpm = round(bpm, 2)
-            # ========================================================
             
             # Triase Kondisi 
             if bpm > 100:
@@ -109,10 +108,8 @@ def lambda_handler(event, context):
                 condition_attr = "BRADYCARDIA"
                 severity_attr = "WARNING"
 
-            # 2. PLOT GRAFIK UNTUK *SEMUA* DATA YANG MASUK (Menggunakan Timestamp X-Axis)
+            # 2. PLOT GRAFIK UNTUK SEMUA DATA YANG MASUK
             plt.figure(figsize=(10, 4))
-            
-            # Menghitung array waktu riil WIB untuk Sumbu X
             start_wib = datetime.utcfromtimestamp(start_time_epoch) + timedelta(hours=7)
             time_x = [start_wib + timedelta(seconds=(i / 250.0)) for i in range(len(filtered_ecg))]
             
@@ -124,25 +121,28 @@ def lambda_handler(event, context):
             plt.ylabel("Amplitudo (ADC Filtered)")
             plt.grid(True)
             
-            # Format sumbu X agar menampilkan jam:menit:detik
             plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-            plt.gcf().autofmt_xdate() # Memutar teks agar tidak bertumpuk
+            plt.gcf().autofmt_xdate()
             
-            # Simpan dan Upload
             temp_image_path = f"/tmp/ecg_{timestamp}.png"
             plt.savefig(temp_image_path)
             plt.close()
             
+            # Upload Grafik (PNG) ke S3
             s3_image_key = f"ecg-alerts-graph/{device_id}/{timestamp}.png"
             s3.upload_file(temp_image_path, BUCKET_NAME, s3_image_key, ExtraArgs={'ContentType': 'image/png'})
             
-            # Khusus untuk alert, generate URL yang bisa dipasang di email SNS
             if alert_triggered:
                 presigned_url = s3.generate_presigned_url(
                     'get_object', Params={'Bucket': BUCKET_NAME, 'Key': s3_image_key}, ExpiresIn=86400 
                 )
 
-        # 3. SIMPAN KE DYNAMODB (Termasuk key gambar S3-nya)
+        # 3. BACKUP RAW JSON KE S3
+        year, month, day = now_wib.strftime("%Y"), now_wib.strftime("%m"), now_wib.strftime("%d")
+        s3_json_key = f"ecg-raw/{device_id}/{year}/{month}/{day}/{timestamp}.json"
+        s3.put_object(Bucket=BUCKET_NAME, Key=s3_json_key, Body=json.dumps(event))
+
+        # 4. SIMPAN KE DYNAMODB
         table.put_item(
             Item={
                 'device_id': device_id,
@@ -153,11 +153,12 @@ def lambda_handler(event, context):
                 'bpm': Decimal(str(bpm)),
                 'status': status_medis,
                 'sinyal': payload,
-                's3_image_key': s3_image_key # Parameter baru untuk Dashboard
+                's3_image_key': s3_image_key,
+                's3_json_key': s3_json_key # Menyimpan referensi path JSON ke database juga
             }
         )
         
-        # Alert SNS dengan URL Lampiran Visual
+        # 5. ALERT SNS
         if alert_triggered and SNS_TOPIC_ARN:
             waktu_kejadian = now_wib.strftime('%Y-%m-%d %H:%M:%S')
             message_body = f"DARURAT MEDIS!\n\nPasien: {nama_pasien} ({device_id})\nTerdeteksi: {status_medis}\nBPM: {bpm}\nWaktu Kejadian: {waktu_kejadian} WIB\n"
