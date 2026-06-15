@@ -2,14 +2,15 @@ import json
 import boto3
 import os
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from scipy.signal import find_peaks, butter, filtfilt, iirnotch
 from decimal import Decimal
 
-# WAJIB: Gunakan backend 'Agg' agar matplotlib bisa jalan di environment serverless tanpa GUI
+# WAJIB: Gunakan backend 'Agg' agar matplotlib bisa jalan di environment serverless
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # Environment Variables
 TABLE_NAME = os.environ.get('TABLE_NAME', 'ECG_Records')
@@ -32,8 +33,10 @@ def lambda_handler(event, context):
         start_time_epoch = event.get('start_time', 0)
         end_time_epoch = event.get('end_time', 0)
         
-        now = datetime.now()
-        timestamp = int(now.timestamp())
+        # 1. STANDARISASI WAKTU KE WIB (UTC+7)
+        now_utc = datetime.utcnow()
+        now_wib = now_utc + timedelta(hours=7)
+        timestamp = int(now_utc.timestamp())
         
         bpm = 0.0
         status_medis = "Normal"
@@ -41,6 +44,7 @@ def lambda_handler(event, context):
         condition_attr = "NORMAL"
         severity_attr = "INFO"
         presigned_url = None
+        s3_image_key = ""
 
         if is_lead_off:
             status_medis = "Sensor Terlepas"
@@ -90,11 +94,10 @@ def lambda_handler(event, context):
                 if bpm > 50: 
                     bpm = 45.0
                     
-            # Pastikan nilai kembali rapi dengan 2 angka di belakang koma
             bpm = round(bpm, 2)
             # ========================================================
             
-            # Triase Kondisi (Menggunakan BPM yang sudah diintervensi)
+            # Triase Kondisi 
             if bpm > 100:
                 status_medis = "Tachycardia"
                 alert_triggered = True
@@ -106,34 +109,40 @@ def lambda_handler(event, context):
                 condition_attr = "BRADYCARDIA"
                 severity_attr = "WARNING"
 
-            # --- PLOT GRAFIK & GENERATE S3 URL JIKA ADA ALERT ---
+            # 2. PLOT GRAFIK UNTUK *SEMUA* DATA YANG MASUK (Menggunakan Timestamp X-Axis)
+            plt.figure(figsize=(10, 4))
+            
+            # Menghitung array waktu riil WIB untuk Sumbu X
+            start_wib = datetime.utcfromtimestamp(start_time_epoch) + timedelta(hours=7)
+            time_x = [start_wib + timedelta(seconds=(i / 250.0)) for i in range(len(filtered_ecg))]
+            
+            warna_grafik = 'green' if condition_attr == "NORMAL" else ('red' if condition_attr == "TACHYCARDIA" else 'orange')
+            plt.plot(time_x, filtered_ecg, color=warna_grafik)
+            
+            plt.title(f"Visualisasi ECG Jendela 5 Detik - {status_medis} ({bpm} BPM)")
+            plt.xlabel("Waktu (WIB)")
+            plt.ylabel("Amplitudo (ADC Filtered)")
+            plt.grid(True)
+            
+            # Format sumbu X agar menampilkan jam:menit:detik
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            plt.gcf().autofmt_xdate() # Memutar teks agar tidak bertumpuk
+            
+            # Simpan dan Upload
+            temp_image_path = f"/tmp/ecg_{timestamp}.png"
+            plt.savefig(temp_image_path)
+            plt.close()
+            
+            s3_image_key = f"ecg-alerts-graph/{device_id}/{timestamp}.png"
+            s3.upload_file(temp_image_path, BUCKET_NAME, s3_image_key, ExtraArgs={'ContentType': 'image/png'})
+            
+            # Khusus untuk alert, generate URL yang bisa dipasang di email SNS
             if alert_triggered:
-                # Membuat Grafik Visual
-                plt.figure(figsize=(10, 4))
-                waktu_x = np.linspace(0, 5, len(filtered_ecg)) # Rentang 5 Detik
-                plt.plot(waktu_x, filtered_ecg, color='red' if condition_attr == "TACHYCARDIA" else 'blue')
-                plt.title(f"Visualisasi ECG Jendela 5 Detik - {status_medis} ({bpm} BPM)")
-                plt.xlabel("Waktu (Detik)")
-                plt.ylabel("Amplitudo (ADC Filtered)")
-                plt.grid(True)
-                
-                # Simpan gambar ke storage temporary Lambda
-                temp_image_path = f"/tmp/ecg_{timestamp}.png"
-                plt.savefig(temp_image_path)
-                plt.close()
-                
-                # Upload gambar ke bucket S3
-                s3_image_key = f"ecg-alerts-graph/{device_id}/{timestamp}.png"
-                s3.upload_file(temp_image_path, BUCKET_NAME, s3_image_key, ExtraArgs={'ContentType': 'image/png'})
-                
-                # Generate Presigned URL (Valid 24 Jam) agar dokter bisa klik dan melihat gambar
                 presigned_url = s3.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': BUCKET_NAME, 'Key': s3_image_key},
-                    ExpiresIn=86400 
+                    'get_object', Params={'Bucket': BUCKET_NAME, 'Key': s3_image_key}, ExpiresIn=86400 
                 )
 
-        # Simpan ke DynamoDB
+        # 3. SIMPAN KE DYNAMODB (Termasuk key gambar S3-nya)
         table.put_item(
             Item={
                 'device_id': device_id,
@@ -143,18 +152,17 @@ def lambda_handler(event, context):
                 'end_time': int(end_time_epoch),
                 'bpm': Decimal(str(bpm)),
                 'status': status_medis,
-                'sinyal': payload 
+                'sinyal': payload,
+                's3_image_key': s3_image_key # Parameter baru untuk Dashboard
             }
         )
         
         # Alert SNS dengan URL Lampiran Visual
         if alert_triggered and SNS_TOPIC_ARN:
-            waktu_kejadian = now.strftime('%Y-%m-%d %H:%M:%S')
-            message_body = f"DARURAT MEDIS!\n\nPasien: {nama_pasien} ({device_id})\nTerdeteksi: {status_medis}\nBPM: {bpm}\nWaktu Kejadian: {waktu_kejadian}\n"
-            
-            # Tambahkan link grafik jika ada
+            waktu_kejadian = now_wib.strftime('%Y-%m-%d %H:%M:%S')
+            message_body = f"DARURAT MEDIS!\n\nPasien: {nama_pasien} ({device_id})\nTerdeteksi: {status_medis}\nBPM: {bpm}\nWaktu Kejadian: {waktu_kejadian} WIB\n"
             if presigned_url:
-                message_body += f"\n[DIAGNOSTIK KLINIS] Klik tautan berikut untuk melihat visualisasi grafik gelombang ECG 5 detik terakhir (Tautan kedaluwarsa dalam 24 jam):\n{presigned_url}"
+                message_body += f"\n[DIAGNOSTIK KLINIS] Klik tautan berikut untuk melihat visualisasi grafik:\n{presigned_url}"
 
             sns.publish(
                 TopicArn=SNS_TOPIC_ARN,
@@ -166,10 +174,7 @@ def lambda_handler(event, context):
                 }
             )
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps({'pesan': 'Pemrosesan berhasil', 'status': status_medis})
-        }
+        return {'statusCode': 200, 'body': json.dumps({'pesan': 'Pemrosesan berhasil', 'status': status_medis})}
 
     except Exception as e:
         print(f"Error fatal Lambda: {str(e)}")
